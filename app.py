@@ -224,7 +224,7 @@ def edit_invoice(pdf_bytes):
 
     # Read Total Current Charges.
     total = find_total_current_charges(page)
-
+st.write("Total Current Charges detected:", total)
     amount = f"{total:.2f}"
     rupee_amount = f"₹ {amount}"
 
