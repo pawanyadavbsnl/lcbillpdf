@@ -90,7 +90,7 @@ def number_to_words(number):
             parts.append(word)
 
     return " ".join(parts) + " Only"
-
+total = find_total_current_charges(page)
 
 # =====================================================
 # FIND TOTAL CURRENT CHARGES
