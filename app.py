@@ -4,11 +4,10 @@ import fitz
 import re
 import io
 import zipfile
-from datetime import datetime
 
-# =====================================================
-# PAGE CONFIGURATION
-# =====================================================
+# =========================================================
+# PAGE SETTINGS
+# =========================================================
 
 st.set_page_config(
     page_title="BSNL Bulk Invoice Editor",
@@ -21,13 +20,13 @@ st.write("Bulk editing of BSNL Leased Circuit PDF Invoices")
 
 st.info(
     "Upload multiple BSNL PDF invoices. "
-    "The application will update the amount fields "
-    "using Total Current Charges."
+    "The application will automatically read Total Current Charges "
+    "and update the specified invoice fields."
 )
 
-# =====================================================
+# =========================================================
 # INDIAN NUMBER TO WORDS
-# =====================================================
+# =========================================================
 
 ONES = [
     "Zero", "One", "Two", "Three", "Four",
@@ -39,8 +38,7 @@ ONES = [
 
 TENS = [
     "", "", "Twenty", "Thirty", "Forty",
-    "Fifty", "Sixty", "Seventy",
-    "Eighty", "Ninety"
+    "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"
 ]
 
 
@@ -82,6 +80,7 @@ def number_to_words(number):
         q, n = divmod(n, value)
 
         if q:
+
             word = under_thousand(q)
 
             if label:
@@ -92,123 +91,113 @@ def number_to_words(number):
     return " ".join(parts) + " Only"
 
 
-# =====================================================
+# =========================================================
 # FIND TOTAL CURRENT CHARGES
-# =====================================================
+# FIXED: READS WORDS FROM THE SAME PDF BASELINE
+# =========================================================
 
 def find_total_current_charges(page):
 
     words = page.get_text("words")
 
-    label_rects = page.search_for(
-        "Total Current Charges"
-    )
-
-    if not label_rects:
-        raise ValueError(
-            "Total Current Charges label not found. "
-            "Please check invoice format."
-        )
-
-    label = label_rects[0]
-
-    candidates = []
-
+    # Locate the word Total
     for word in words:
 
-        rect = fitz.Rect(word[:4])
-
-        if not re.fullmatch(
-            r"[\d,]+\.\d{2}", word[4]
-        ):
+        if word[4].strip().lower() != "total":
             continue
 
-        if (
-            rect.x0 >= label.x1 - 2
-            and abs(rect.y0 - label.y0) < 10
-        ):
-            candidates.append((rect, word[4]))
+        y = word[1]
 
-    if not candidates:
-        raise ValueError(
-            "Total Current Charges amount could not be read."
+        # Get words on the same horizontal line
+        line_words = [
+            w for w in words
+            if abs(w[1] - y) <= 3
+        ]
+
+        line_words.sort(key=lambda x: x[0])
+
+        line_text = " ".join(
+            w[4] for w in line_words
         )
 
-    candidates.sort(key=lambda x: x[0].x0)
-
-    return float(
-        candidates[0][1].replace(",", "")
-    )
-
-
-# =====================================================
-# FIND AMOUNT INSIDE SPECIFIED AREA
-# =====================================================
-
-def find_amount_in_area(page, area, used):
-
-    area = fitz.Rect(area)
-
-    candidates = []
-
-    for word in page.get_text("words"):
-
-        rect = fitz.Rect(word[:4])
-
-        if not re.fullmatch(
-            r"[\d,]+\.\d{2}", word[4]
+        if re.search(
+            r"Total\s+Current\s+Charges",
+            line_text,
+            re.IGNORECASE
         ):
-            continue
 
-        if not area.contains(rect):
-            continue
+            # Find amount on the same line
+            amounts = []
 
-        if any(rect.intersects(x) for x in used):
-            continue
+            for w in line_words:
 
-        candidates.append(rect)
+                if w[0] < word[0]:
+                    continue
 
-    if not candidates:
-        return None
+                if re.fullmatch(
+                    r"[\d,]+\.\d{2}", w[4]
+                ):
+                    amounts.append(w[4])
 
-    # Select the amount closest to the right side.
-    candidates.sort(
-        key=lambda r: (r.y0, -r.x0)
+            if amounts:
+
+                return float(
+                    amounts[-1].replace(",", "")
+                )
+
+    # Fallback: use text blocks
+    blocks = page.get_text("blocks")
+
+    for block in blocks:
+
+        text = block[4]
+
+        if "Total Current Charges" in text:
+
+            numbers = re.findall(
+                r"[\d,]+\.\d{2}",
+                text
+            )
+
+            if numbers:
+
+                return float(
+                    numbers[-1].replace(",", "")
+                )
+
+    raise ValueError(
+        "Total Current Charges amount could not be read. "
+        "Check whether the PDF contains selectable text."
     )
 
-    return candidates[0]
+
+# =========================================================
+# INVOICE FIELD COORDINATES
+# BASED ON YOUR UPLOADED BSNL INVOICE
+# =========================================================
+
+BASE_WIDTH = 595.276
+BASE_HEIGHT = 841.890
 
 
-# =====================================================
-# AMOUNT IN WORDS AREA
-# =====================================================
+def scaled_rect(page, coordinates):
 
-def find_words_area(page):
+    x0, y0, x1, y1 = coordinates
 
-    labels = page.search_for(
-        "Amount in Words:"
-    )
+    sx = page.rect.width / BASE_WIDTH
+    sy = page.rect.height / BASE_HEIGHT
 
-    if not labels:
-        raise ValueError(
-            "Amount in Words label not found."
-        )
-
-    label = labels[0]
-
-    # Original words may occupy two lines.
-    # Keep the correction inside the header's available space.
     return fitz.Rect(
-        label.x1 + 2,
-        label.y0 - 2,
-        page.rect.width - 35,
-        label.y0 + 25
+        x0 * sx,
+        y0 * sy,
+        x1 * sx,
+        y1 * sy
     )
 
 
-# =====================================================
-# EDIT PDF
-# =====================================================
+# =========================================================
+# PREPARE INVOICE CORRECTIONS
+# =========================================================
 
 def edit_invoice(pdf_bytes):
 
@@ -218,132 +207,115 @@ def edit_invoice(pdf_bytes):
     )
 
     if len(doc) == 0:
-        raise ValueError("Empty PDF.")
+        raise ValueError("Invalid PDF file.")
 
     page = doc[0]
 
-    # Read Total Current Charges.
-    total = find_total_current_charges(page)
-st.write("Total Current Charges detected:", total)
-    amount = f"{total:.2f}"
-    rupee_amount = f"₹ {amount}"
+    # -----------------------------------------------------
+    # READ TOTAL CURRENT CHARGES
+    # -----------------------------------------------------
 
-    words_amount = (
+    total = find_total_current_charges(page)
+
+    amount = f"{total:.2f}"
+
+    rupee_amount = "₹ " + amount
+
+    amount_words = (
         "Rupees " + number_to_words(total)
     )
 
-    # -------------------------------------------------
-    # Define the five amount locations.
-    # Coordinates are based on the supplied BSNL
-    # invoice template (page 1).
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # EXACT AMOUNT FIELD LOCATIONS
+    # -----------------------------------------------------
 
-    target_areas = {
+    corrections = [
 
-        # 1. Top right AMOUNT PAYABLE
-        "Header Amount Payable":
-            (450, 120, 575, 160),
+        # 1. Header Amount Payable
+        (
+            (476, 134, 535, 148),
+            rupee_amount,
+            7.5
+        ),
 
-        # 2. Account Summary - Account Balance
-        "Account Balance":
-            (400, 245, 480, 270),
+        # 2. Account Balance
+        (
+            (405, 252, 453, 265),
+            rupee_amount,
+            7.5
+        ),
 
-        # 3. Account Summary - Amount Payable
-        "Summary Amount Payable":
-            (480, 235, 570, 260),
+        # 3. Account Summary Amount Payable
+        # Excludes the Rounded Up text below.
+        (
+            (508, 244, 557, 254),
+            rupee_amount,
+            7.0
+        ),
 
         # 4. Payment slip cheque amount
-        "Payment Slip Amount":
-            (215, 725, 280, 750),
+        (
+            (220, 734, 270, 747),
+            rupee_amount,
+            7.5
+        ),
 
-        # 5. Payment slip right side Amount Payable
-        "Payment Slip Amount Payable":
-            (465, 765, 550, 790)
-    }
+        # 5. Payment slip Amount Payable
+        (
+            (470, 772, 522, 785),
+            rupee_amount,
+            7.5
+        ),
 
-    used = []
+        # 6. Previous Balance = ZERO
+        (
+            (25, 253, 69, 265),
+            "₹ 0.00",
+            7.5
+        ),
+
+        # 7. Last Payment = ZERO
+        (
+            (119, 253, 145, 265),
+            "₹ 0.00",
+            7.5
+        )
+    ]
+
     patches = []
 
-    # -------------------------------------------------
-    # Find all five amounts.
-    # -------------------------------------------------
+    # Convert coordinates according to PDF page size
+    for coordinates, new_text, fontsize in corrections:
 
-    for field, area in target_areas.items():
-
-        rect = find_amount_in_area(
+        rect = scaled_rect(
             page,
-            area,
-            used
+            coordinates
         )
-
-        if rect is None:
-
-            raise ValueError(
-                f"Could not locate {field}. "
-                "Invoice layout may be different."
-            )
 
         patches.append(
-            (rect, rupee_amount, 8)
+            (rect, new_text, fontsize)
         )
 
-        used.append(rect)
+    # -----------------------------------------------------
+    # AMOUNT IN WORDS
+    # -----------------------------------------------------
 
-    # -------------------------------------------------
-    # Previous Balance = ZERO
-    # -------------------------------------------------
-
-    previous_rect = find_amount_in_area(
+    words_rect = scaled_rect(
         page,
-        (15, 245, 100, 270),
-        used
+        (349, 57, 552, 82)
     )
 
-    if previous_rect is None:
-        raise ValueError(
-            "Previous Balance amount not found."
+    patches.append(
+        (
+            words_rect,
+            amount_words,
+            7.5
         )
-
-    patches.append(
-        (previous_rect, "₹ 0.00", 8)
     )
 
-    used.append(previous_rect)
-
-    # -------------------------------------------------
-    # Last Payment = ZERO
-    # -------------------------------------------------
-
-    last_payment_rect = find_amount_in_area(
-        page,
-        (110, 245, 185, 270),
-        used
-    )
-
-    if last_payment_rect is None:
-        raise ValueError(
-            "Last Payment amount not found."
-        )
-
-    patches.append(
-        (last_payment_rect, "₹ 0.00", 8)
-    )
-
-    used.append(last_payment_rect)
-
-    # -------------------------------------------------
-    # Amount in Words
-    # -------------------------------------------------
-
-    word_rect = find_words_area(page)
-
-    patches.append(
-        (word_rect, words_amount, 8)
-    )
-
-    # -------------------------------------------------
-    # Apply redactions
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # APPLY ALL REDACTIONS
+    # -----------------------------------------------------
 
     for rect, new_text, fontsize in patches:
 
@@ -357,9 +329,9 @@ st.write("Total Current Charges detected:", total)
         graphics=0
     )
 
-    # -------------------------------------------------
-    # Insert revised text
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # INSERT UPDATED VALUES
+    # -----------------------------------------------------
 
     for rect, new_text, fontsize in patches:
 
@@ -379,14 +351,15 @@ st.write("Total Current Charges detected:", total)
         )
 
         if result < 0:
+
             raise ValueError(
-                "Text does not fit in the invoice field: "
+                "Text could not fit in the invoice field: "
                 + new_text
             )
 
-    # -------------------------------------------------
-    # Save revised PDF in memory
-    # -------------------------------------------------
+    # -----------------------------------------------------
+    # SAVE REVISED PDF
+    # -----------------------------------------------------
 
     output = doc.tobytes(
         garbage=4,
@@ -395,27 +368,27 @@ st.write("Total Current Charges detected:", total)
 
     doc.close()
 
-    return output, total, words_amount
+    return output, total, amount_words
 
 
-# =====================================================
-# STREAMLIT USER INTERFACE
-# =====================================================
+# =========================================================
+# STREAMLIT INTERFACE
+# =========================================================
 
 st.divider()
 
-st.subheader("Upload Invoice PDFs")
+st.subheader("Upload BSNL Invoice PDFs")
 
 uploaded_files = st.file_uploader(
-    "Select multiple BSNL invoice PDF files",
+    "Choose multiple PDF invoices",
     type=["pdf"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
 
-    st.write(
-        f"Total invoices selected: {len(uploaded_files)}"
+    st.success(
+        f"{len(uploaded_files)} invoice(s) selected."
     )
 
     if st.button(
@@ -426,8 +399,10 @@ if uploaded_files:
 
         zip_buffer = io.BytesIO()
 
-        success_count = 0
-        failed_files = []
+        successful = 0
+
+        failed = []
+
         report = []
 
         progress = st.progress(0)
@@ -446,10 +421,8 @@ if uploaded_files:
 
                 try:
 
-                    revised_pdf, total, words = (
-                        edit_invoice(
-                            uploaded.getvalue()
-                        )
+                    revised_pdf, total, words = edit_invoice(
+                        uploaded.getvalue()
                     )
 
                     filename = (
@@ -462,10 +435,10 @@ if uploaded_files:
                         revised_pdf
                     )
 
-                    success_count += 1
+                    successful += 1
 
                     report.append({
-                        "Invoice": uploaded.name,
+                        "Invoice Name": uploaded.name,
                         "Total Current Charges":
                             f"₹ {total:,.2f}",
                         "Amount in Words": words,
@@ -474,8 +447,8 @@ if uploaded_files:
 
                 except Exception as error:
 
-                    failed_files.append({
-                        "Invoice": uploaded.name,
+                    failed.append({
+                        "Invoice Name": uploaded.name,
                         "Error": str(error)
                     })
 
@@ -484,12 +457,12 @@ if uploaded_files:
                 )
 
         # -------------------------------------------------
-        # RESULTS
+        # PROCESSING REPORT
         # -------------------------------------------------
 
         st.divider()
 
-        st.subheader("Processing Summary")
+        st.subheader("Processing Results")
 
         col1, col2, col3 = st.columns(3)
 
@@ -499,13 +472,13 @@ if uploaded_files:
         )
 
         col2.metric(
-            "Successful",
-            success_count
+            "Successfully Processed",
+            successful
         )
 
         col3.metric(
             "Failed",
-            len(failed_files)
+            len(failed)
         )
 
         if report:
@@ -520,7 +493,7 @@ if uploaded_files:
             )
 
             st.download_button(
-                label="DOWNLOAD ALL REVISED INVOICES",
+                label="DOWNLOAD ALL REVISED INVOICES (ZIP)",
                 data=zip_buffer.getvalue(),
                 file_name="BSNL_Revised_Invoices.zip",
                 mime="application/zip",
@@ -528,23 +501,30 @@ if uploaded_files:
                 use_container_width=True
             )
 
-        if failed_files:
+        if failed:
 
             st.error(
-                "Some invoices could not be processed."
+                "The following invoices could not be processed:"
             )
 
             st.dataframe(
-                failed_files,
+                failed,
                 use_container_width=True
             )
+
+
+# =========================================================
+# CORRECTION RULES
+# =========================================================
 
 st.divider()
 
 st.subheader("Correction Rules")
 
 st.table({
+
     "Invoice Field": [
+
         "Amount Payable - Header",
         "Account Balance",
         "Amount Payable - Summary",
@@ -555,7 +535,8 @@ st.table({
         "Amount in Words"
     ],
 
-    "New Value": [
+    "Updated Value": [
+
         "Total Current Charges",
         "Total Current Charges",
         "Total Current Charges",
@@ -565,17 +546,18 @@ st.table({
         "₹ 0.00",
         "Automatically converted"
     ]
+
 })
 
+
 st.caption(
-    "BSNL Bulk Invoice Editor | PDF processing utility"
+    "BSNL Bulk Invoice Editor | PDF Processing Utility"
 )
 
 st.warning(
-    "Important: This program is designed for the supplied "
-    "BSNL invoice layout. It edits page 1 only. It does not "
-    "regenerate IRN, QR codes, or digitally signed invoice "
-    "content. Test on copies and verify every output before "
-    "any official use. Do not use it to alter issued tax "
-    "invoices without authorized approval."
+    "This application is designed for the supplied BSNL "
+    "invoice layout. It edits page 1 only. It does not "
+    "regenerate IRN, QR codes, or digital signatures. "
+    "Test all outputs before official use and obtain "
+    "appropriate authorization for invoice corrections."
 )
